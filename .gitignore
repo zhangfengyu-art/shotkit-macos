@@ -1,0 +1,15 @@
+.DS_Store
+build/
+dist/
+__pycache__/
+*.pyc
+*.dSYM/
+*.xcresult/
+*.log
+.env
+.env.*
+screenshot-data/
+shotkit-install.json
+.shotkit-backups/
+backup-*/
+installation.json
