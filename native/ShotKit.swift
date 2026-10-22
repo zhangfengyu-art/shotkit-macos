@@ -8,7 +8,8 @@ import Translation
 import ImageIO
 import NaturalLanguage
 
-// A resident AX / AppKit service plus on-demand image and document workers.
+// Shared native image tools. The default entry point is the independent menu bar app.
+var standaloneRuntime = false
 enum ShotError: LocalizedError {
     case message(String)
     var errorDescription: String? { if case let .message(s) = self { return s }; return nil }
@@ -55,12 +56,22 @@ func copyImage(_ image: NSImage) {
 
 func accessibilityChain(_ args: [String]) throws -> [[String: Any]] {
     guard args.count >= 4, let pid = Int32(args[1]), let x = Double(args[2]), let y = Double(args[3]) else { return [] }
+    return accessibilityTargets(pid,at:CGPoint(x:x,y:y)).map { target in
+        ["x":Double(target.rect.minX),"y":Double(target.rect.minY),"w":Double(target.rect.width),"h":Double(target.rect.height),"role":target.role]
+    }
+}
+
+// Keep geometry typed inside the app. CGFloat held in Any does not cast to Double;
+// the former JSON bridge used to hide that distinction.
+func accessibilityTargets(_ pid: pid_t,at point: CGPoint) -> [ShotTarget] {
+    let x=point.x,y=point.y
+    guard x.isFinite,y.isFinite else {return []}
     let app = AXUIElementCreateApplication(pid)
     AXUIElementSetMessagingTimeout(app, 0.025)
     var hit: AXUIElement?
     guard AXUIElementCopyElementAtPosition(app, Float(x), Float(y), &hit) == .success else { return [] }
     let start = ProcessInfo.processInfo.systemUptime
-    var result = [[String: Any]]()
+    var result = [ShotTarget]()
     var current = hit
     func attribute(_ e: AXUIElement, _ key: String) -> CFTypeRef? {
         var value: CFTypeRef?
@@ -78,7 +89,7 @@ func accessibilityChain(_ args: [String]) throws -> [[String: Any]] {
             let role = attribute(e, kAXRoleAttribute) as? String ?? ""
             let decorative = ["AXSplitter", "AXScrollBar", "AXRuler", "AXGrowArea", "AXHandle", "AXSeparator"].contains(role)
             if !decorative && (role != "AXStaticText" || (s.width >= 60 && s.height >= 20)) {
-                result.append(["x": p.x, "y": p.y, "w": s.width, "h": s.height, "role": role])
+                result.append(ShotTarget(rect:CGRect(origin:p,size:s),role:role))
             }
         }
         guard let parent = attribute(e, kAXParentAttribute), CFGetTypeID(parent) == AXUIElementGetTypeID() else { break }
@@ -97,9 +108,15 @@ func configureRecognition(_ request: VNRecognizeTextRequest) throws {
     request.recognitionLanguages = ["zh-Hans", "zh-Hant", "en-US", "ja-JP", "ko-KR"].filter { supported.contains($0) }
 }
 func recognize(_ path: String, includeCodes: Bool = true, request: VNRecognizeTextRequest = VNRecognizeTextRequest()) throws -> [String: Any] {
+    try recognizeHandler(VNImageRequestHandler(url:URL(fileURLWithPath:path)),includeCodes:includeCodes,request:request)
+}
+func recognize(_ image: CGImage, includeCodes: Bool = true, request: VNRecognizeTextRequest = VNRecognizeTextRequest()) throws -> [String: Any] {
+    try recognizeHandler(VNImageRequestHandler(cgImage:image),includeCodes:includeCodes,request:request)
+}
+private func recognizeHandler(_ handler: VNImageRequestHandler,includeCodes: Bool,request: VNRecognizeTextRequest) throws -> [String:Any] {
     try configureRecognition(request)
     let codes = VNDetectBarcodesRequest()
-    try VNImageRequestHandler(url: URL(fileURLWithPath: path)).perform(includeCodes ? [request, codes] : [request])
+    try handler.perform(includeCodes ? [request, codes] : [request])
     // Preserve line ordering instead of joining distant columns into one sentence.
     let lines = (request.results ?? []).sorted {
         if abs($0.boundingBox.midY - $1.boundingBox.midY) > 0.012 { return $0.boundingBox.midY > $1.boundingBox.midY }
@@ -349,6 +366,8 @@ final class EditorController: NSObject, NSWindowDelegate, NSToolbarDelegate {
     let window: NSWindow, editor: EditorView
     let output: String
     var accepted = false
+    var onFinish: ((String)->Void)?
+    var onClose: (()->Void)?
     let help = NSTextField(labelWithString: "")
     let dimensions = NSTextField(labelWithString: "")
     let tools = NSSegmentedControl()
@@ -357,8 +376,9 @@ final class EditorController: NSObject, NSWindowDelegate, NSToolbarDelegate {
     var undoItem: NSToolbarItem?, redoItem: NSToolbarItem?
     let toolIcons = ["arrow.up.right", "rectangle", "pencil.tip", "textformat", "rectangle.fill", "square.grid.3x3.fill", "crop"]
     let hints: [Tool:String] = [.arrow:"拖动鼠标画箭头",.box:"拖动框出需要强调的位置",.pen:"按住鼠标自由绘画",.text:"点一下图片，输入要添加的文字",.redact:"拖动覆盖内容，导出为不透明的黑色像素",.mosaic:"拖动选择要加马赛克的区域",.crop:"拖出要保留的范围，完成时按最后一个框裁剪"]
-    init(path: String, output: String) throws {
-        self.output = output; editor = EditorView(try loadShot(path))
+    convenience init(path: String, output: String) throws { try self.init(image:loadShot(path),output:output) }
+    init(image: NSImage, output: String) {
+        self.output = output; editor = EditorView(image)
         window = NSWindow(contentRect: NSRect(x: 0,y: 0,width: 1080,height: 740),styleMask: [.titled,.closable,.resizable,.miniaturizable],backing: .buffered,defer: false)
         super.init()
         window.title = "标注截图"; window.subtitle = "箭头、文字、遮盖与裁剪"
@@ -437,7 +457,7 @@ final class EditorController: NSObject, NSWindowDelegate, NSToolbarDelegate {
     @objc func redoAction() { editor.redoMark() }
     func result() throws -> NSImage { try flattened(editor.base,editor.marks,crop: editor.crop) }
     @objc func finish() {
-        do { let image = try result(); try savePNG(image,output); accepted = true; emit(["path": output]); window.close(); NSApp.stop(nil) }
+        do { let image = try result(); try savePNG(image,output); accepted = true; if let onFinish { onFinish(output) } else { emit(["path": output]) }; window.close(); if !standaloneRuntime { NSApp.stop(nil) } }
         catch { showError(error.localizedDescription) }
     }
     @objc func saveAs() {
@@ -448,7 +468,7 @@ final class EditorController: NSObject, NSWindowDelegate, NSToolbarDelegate {
             }
         }
     }
-    func windowWillClose(_ notification: Notification) { if !accepted { emit(["cancelled": true]) }; NSApp.stop(nil) }
+    func windowWillClose(_ notification: Notification) { if !accepted && !standaloneRuntime { emit(["cancelled": true]) }; onClose?(); if !standaloneRuntime { NSApp.stop(nil) } }
 }
 
 func showError(_ message: String) { let a = NSAlert(); a.messageText = message; a.runModal() }
@@ -471,14 +491,16 @@ final class PinView: NSImageView {
     }
     @objc func copyPin() { if let image = image { copyImage(image) } }
     @objc func alphaPin() { window?.alphaValue = window?.alphaValue == 1 ? 0.55 : 1 }
-    @objc func closePin() { window?.close(); NSApp.stop(nil) }
+    @objc func closePin() { window?.close() }
     override var acceptsFirstResponder: Bool { true }
     override func keyDown(with event: NSEvent) { if event.keyCode == 53 { closePin() } else { super.keyDown(with: event) } }
 }
 final class PinController: NSObject, NSWindowDelegate {
     let window: NSWindow
-    init(path: String) throws {
-        let image = try loadShot(path), maxSize = NSScreen.main?.visibleFrame.size ?? NSSize(width: 1200,height: 800)
+    var onClose: (()->Void)?
+    convenience init(path: String) throws { self.init(image:try loadShot(path)) }
+    init(image: NSImage) {
+        let maxSize = NSScreen.main?.visibleFrame.size ?? NSSize(width: 1200,height: 800)
         let scale = min(1,min(maxSize.width*0.65/image.size.width,maxSize.height*0.7/image.size.height))
         window = NSWindow(contentRect: NSRect(x: 0,y: 0,width: image.size.width*scale,height: image.size.height*scale),styleMask: [.titled,.closable,.resizable],backing: .buffered,defer: false)
         super.init(); window.title = "贴图"; window.delegate = self; window.isReleasedWhenClosed = false
@@ -487,7 +509,7 @@ final class PinController: NSObject, NSWindowDelegate {
         window.contentView = view; window.center(); window.makeKeyAndOrderFront(nil); window.makeFirstResponder(view)
         NSApp.activate(ignoringOtherApps: true)
     }
-    func windowWillClose(_ notification: Notification) { NSApp.stop(nil) }
+    func windowWillClose(_ notification: Notification) { onClose?(); if !standaloneRuntime { NSApp.stop(nil) } }
 }
 
 final class TextResultController: NSObject, NSWindowDelegate, NSToolbarDelegate, NSTextViewDelegate {
@@ -497,8 +519,11 @@ final class TextResultController: NSObject, NSWindowDelegate, NSToolbarDelegate,
     let count = NSTextField(labelWithString: "")
     var translationWindow: NSWindow?
     let isQR: Bool
-    init(path: String, qr: Bool) throws {
-        let text = try String(contentsOfFile: path,encoding: .utf8); isQR = qr
+    var onClose: (()->Void)?
+    var onTranslate: ((String)->Void)?
+    convenience init(path: String, qr: Bool) throws { self.init(text:try String(contentsOfFile:path,encoding:.utf8),qr:qr) }
+    init(text: String, qr: Bool) {
+        isQR = qr
         window = NSWindow(contentRect: NSRect(x: 0,y: 0,width: 760,height: 570),styleMask: [.titled,.closable,.resizable],backing: .buffered,defer: false)
         super.init()
         window.title = qr ? "二维码内容" : "提取文字"; window.subtitle = "本机识别 · 可直接编辑"
@@ -549,6 +574,7 @@ final class TextResultController: NSObject, NSWindowDelegate, NSToolbarDelegate,
         }
     }
     @objc func translateText() {
+        if let onTranslate { onTranslate(textView.string); return }
         if translationWindow == nil {
             translationWindow = NSWindow(contentRect: NSRect(x: 0,y: 0,width: 860,height: 600),styleMask: [.titled,.closable,.resizable],backing: .buffered,defer: false)
             translationWindow?.title = "截图翻译"; translationWindow?.isReleasedWhenClosed = false
@@ -556,7 +582,7 @@ final class TextResultController: NSObject, NSWindowDelegate, NSToolbarDelegate,
         translationWindow?.contentView = NSHostingView(rootView: TranslationPanel(source: textView.string))
         translationWindow?.center(); translationWindow?.makeKeyAndOrderFront(nil)
     }
-    func windowWillClose(_ notification: Notification) { translationWindow?.close(); NSApp.stop(nil) }
+    func windowWillClose(_ notification: Notification) { translationWindow?.close(); onClose?(); if !standaloneRuntime { NSApp.stop(nil) } }
 }
 
 struct SystemGlassAction: ViewModifier {
@@ -625,10 +651,16 @@ func selfTest(_ directory: String) throws {
 }
 
 let args = Array(CommandLine.arguments.dropFirst())
-guard let mode = args.first else { fail("缺少命令") }
+let mode = args.first?.hasPrefix("-psn_")==true ? "app" : (args.first ?? "app")
 do {
     switch mode {
-    case "service": _ = NSApplication.shared; let service = ShotService(); service.start(); withExtendedLifetime(service) {}
+    case "app", "--demo":
+        _ = NSApplication.shared; standaloneRuntime=true
+        MainActor.assumeIsolated { let delegate=StandaloneApp(demo:mode=="--demo"); NSApp.delegate=delegate; NSApp.run(); withExtendedLifetime(delegate) {} }
+    case "selection-settings-selftest": try selectionSettingsSelfTest()
+    case "native-selftest":
+        guard args.count==2 else {fail("缺少测试输出目录")}
+        _ = NSApplication.shared; NSApp.setActivationPolicy(.prohibited); try MainActor.assumeIsolated {try nativeSelfTest(args[1])}
     case "save":
         guard args.count == 2 else { fail("缺少图片") }
         _ = NSApplication.shared; NSApp.setActivationPolicy(.accessory); NSApp.activate(ignoringOtherApps: true)
@@ -644,7 +676,7 @@ do {
     case "ocr": guard args.count == 2 else { fail("缺少图片") }; emit(try recognize(args[1],includeCodes:false))
     case "qr": guard args.count == 2 else { fail("缺少图片") }; emit(try recognizeCodes(args[1]))
     case "stitch": guard args.count >= 4 else { fail("缺少拼接图片") }; emit(try stitch(Array(args.dropFirst(2)),output: args[1]))
-    case "selftest": _ = NSApplication.shared; NSApp.setActivationPolicy(.prohibited); try selfTest(args[1])
+    case "selftest": guard args.count==2 else {fail("缺少测试输出目录")}; _ = NSApplication.shared; NSApp.setActivationPolicy(.prohibited); try selfTest(args[1])
     case "edit", "pin", "translate", "text":
         guard args.count >= 2 else { fail("缺少图片") }
         _ = NSApplication.shared; NSApp.setActivationPolicy(.accessory)

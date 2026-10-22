@@ -38,13 +38,13 @@ final class NativeStatusUI {
             image.image = symbol(warning ? "exclamationmark.circle.fill" : done ? "checkmark.circle.fill" : "info.circle",text,size: 21)
             image.contentTintColor = warning ? .systemOrange : done ? .systemGreen : .secondaryLabelColor
         }
-        let maxWidth = min(560,(data["screenWidth"] as? Double ?? 800)-40)
+        let maxWidth = min(560,((data["screenWidth"] as? NSNumber)?.doubleValue ?? 800)-40)
         let measured = (text as NSString).size(withAttributes: [.font: message.font!]).width
         let width = min(maxWidth,max(210,measured+76))
         message.preferredMaxLayoutWidth = width-76
         let bounds = (text as NSString).boundingRect(with: NSSize(width: width-76,height: 100),options: [.usesLineFragmentOrigin],attributes: [.font: message.font!])
         let height = min(96,max(52,ceil(bounds.height)+30))
-        let x = data["centerX"] as? Double ?? 500, y = data["bottomY"] as? Double ?? 700
+        let x = (data["centerX"] as? NSNumber)?.doubleValue ?? 500, y = (data["bottomY"] as? NSNumber)?.doubleValue ?? 700
         let top = NSScreen.screens.first?.frame.maxY ?? 0
         panel.setFrame(NSRect(x: x-width/2,y: top-y,width: width,height: height),display: true)
         let animated = data["motion"] as? Bool != false && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion

@@ -13,3 +13,7 @@ shotkit-install.json
 .shotkit-backups/
 backup-*/
 installation.json
+shotkit-native-install.json
+.shotkit-native-backups/
+status.json
+native-report.json

@@ -24,31 +24,30 @@ final class CaptureButton: NSButton {
     required init?(coder: NSCoder) { super.init(coder: coder); setupFeedback() }
     private func setupFeedback() {
         wantsLayer = true; layer?.addSublayer(feedback); feedback.cornerRadius = 12
-        feedback.zPosition = -1; feedback.opacity = 0
+        feedback.zPosition = -1; feedback.opacity = 0; feedback.cornerCurve = .continuous
+        layer?.masksToBounds=true
     }
     override func layout() {
         super.layout()
         CATransaction.begin(); CATransaction.setDisableActions(true)
-        feedback.frame = bounds.insetBy(dx: 2, dy: 2)
-        layer?.anchorPoint = CGPoint(x: 0.5,y: 0.5)
-        layer?.position = CGPoint(x: frame.midX,y: frame.midY)
+        feedback.frame = bounds
         CATransaction.commit()
     }
     private func render() {
         interaction = !isEnabled ? "disabled" : holding ? "holding" : down ? "pressed" : inside ? "hover" : "idle"
         let animated = motion && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        let scale: CGFloat = down ? 0.92 : inside ? 1.035 : 1
+        let scale: CGFloat = down ? 0.98 : 1
         let opacity: Float = !isEnabled ? 0 : down ? 0.24 : holding ? 0.19 : inside ? 0.12 : 0
-        let oldScale = layer?.presentation()?.value(forKeyPath:"transform.scale") as? CGFloat ?? 1
+        let oldScale = feedback.presentation()?.value(forKeyPath:"transform.scale") as? CGFloat ?? 1
         let oldOpacity = feedback.presentation()?.opacity ?? feedback.opacity
         CATransaction.begin(); CATransaction.setDisableActions(true)
         feedback.backgroundColor = NSColor.labelColor.cgColor
-        feedback.opacity = opacity; layer?.transform = CATransform3DMakeScale(animated ? scale : 1,animated ? scale : 1,1)
+        feedback.opacity = opacity; feedback.transform = CATransform3DMakeScale(animated ? scale : 1,animated ? scale : 1,1)
         CATransaction.commit()
-        guard animated else { layer?.removeAnimation(forKey:"press"); feedback.removeAllAnimations(); return }
+        guard animated else { feedback.removeAllAnimations(); return }
         let spring = CASpringAnimation(keyPath:"transform.scale"); spring.fromValue = oldScale; spring.toValue = scale
         spring.mass = 1; spring.stiffness = down ? 650 : 420; spring.damping = down ? 42 : 28
-        spring.duration = down ? 0.10 : 0.28; layer?.add(spring,forKey:"press")
+        spring.duration = down ? 0.10 : 0.28; feedback.add(spring,forKey:"press")
         let fade = CABasicAnimation(keyPath:"opacity"); fade.fromValue = oldOpacity; fade.toValue = opacity; fade.duration = 0.10; feedback.add(fade,forKey:"feedback")
     }
     override var isEnabled: Bool { didSet { if !isEnabled { down = false; holding = false }; render() } }
@@ -81,7 +80,7 @@ final class CaptureButton: NSButton {
                 NSHapticFeedbackManager.defaultPerformer.perform(.alignment,performanceTime:.now)
                 longPress(); resetInteraction(); return
             }
-            inside = bounds.contains(convert(next.locationInWindow,from:nil))
+            inside = containsPointer(convert(next.locationInWindow,from:nil))
             if !inside { longEligible = false }
             down = inside; render(); hover?(inside)
             if next.type == .leftMouseUp {
@@ -99,7 +98,11 @@ final class CaptureButton: NSButton {
     override func accessibilityPerformPress() -> Bool { guard isEnabled else { return false }; performClick(nil); return true }
     override func accessibilityPerformShowMenu() -> Bool { guard isEnabled, let longPress else { return false }; longPress(); return true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-    override func hitTest(_ point: NSPoint) -> NSView? { super.hitTest(point) == nil ? nil : self }
+    func containsPointer(_ point: NSPoint) -> Bool {NSBezierPath(roundedRect:bounds,xRadius:12,yRadius:12).contains(point)}
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let local=convert(point,from:superview)
+        return !isHidden && containsPointer(local) ? self : nil
+    }
     func compactContent(title: String, icon: String) {
         self.title = ""; image = nil
         let glyph = NSImageView(); glyph.image = symbol(icon,title,size: 16); glyph.imageScaling = .scaleProportionallyDown; glyph.contentTintColor = .labelColor
@@ -153,6 +156,7 @@ final class NativeCaptureUI: NSObject, NSMenuDelegate {
     var send: (([String: Any]) -> Void)?
     var buttons = [String: CaptureButton]()
     var motion = true
+    var activeMenu: NSMenu?
     var defaultTip = "拖动选区可移动 · 长按工具查看更多 · Return 复制"
 
     init(kind: String) {
@@ -166,18 +170,11 @@ final class NativeCaptureUI: NSObject, NSMenuDelegate {
         panel.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.overlayWindow)) + 2)
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         panel.title = kind == "toolbar" ? "截图工具栏" : "滚动截图"
-        if kind == "toolbar" {
-            if #available(macOS 26.0, *) {
-                let container = NSGlassEffectContainerView(frame: NSRect(origin: .zero,size: size))
-                container.spacing = 6; container.contentView = content; panel.contentView = container
-            } else { content.frame = NSRect(origin: .zero,size: size); panel.contentView = content }
-        } else {
-            let surface = glassSurface(content,radius: 24); surface.frame = NSRect(origin: .zero,size: size); panel.contentView = surface
-        }
+        let surface = glassSurface(content,radius: 24); surface.frame = NSRect(origin: .zero,size: size); panel.contentView = surface
         tip.font = .systemFont(ofSize: 11); tip.textColor = .labelColor
         tip.alignment = .center; tip.lineBreakMode = .byTruncatingTail
         tip.translatesAutoresizingMaskIntoConstraints = false
-        if kind != "toolbar" { content.addSubview(tip) }
+        content.addSubview(tip)
         if kind == "toolbar" { buildToolbar() } else { buildLongHUD() }
     }
 
@@ -203,51 +200,39 @@ final class NativeCaptureUI: NSObject, NSMenuDelegate {
     }
 
     func buildToolbar() {
-        let row = NSStackView(); row.orientation = .horizontal; row.alignment = .centerY; row.spacing = 10
-        row.translatesAutoresizingMaskIntoConstraints = false; content.addSubview(row)
-        let cancel = button("cancel", "取消", "xmark", "取消截图 · Esc")
-        cancel.title = ""; cancel.imagePosition = .imageOnly
-        let cancelGlass = glassSurface(cancel,radius: 20)
-        row.addArrangedSubview(cancelGlass)
-        cancelGlass.widthAnchor.constraint(equalToConstant: 40).isActive = true
-        cancelGlass.heightAnchor.constraint(equalToConstant: 40).isActive = true
-        let actions = NSStackView(); actions.orientation = .horizontal; actions.spacing = 0; actions.alignment = .centerY
-        let definitions = [
-            ("edit", "标注", "square.and.pencil", "标注 · E  箭头、文字、遮盖与裁剪"),
-            ("ocr", "文字", "text.viewfinder", "提取文字 · O  识别后可修改、复制或翻译"),
-            ("translate", "翻译", "character.bubble", "翻译 · T  自动识别选区文字并翻译"),
-            ("pin", "贴图", "pin", "贴图 · P  置顶对照，滚轮缩放，右键关闭"),
-            ("long", "长截图", "rectangle.portrait.and.arrow.right", "长截图 · L  逐段截取，保留三分之一重叠"),
-            ("save", "保存", "square.and.arrow.down", "保存 · S  选择文件名和保存位置"),
-            ("more", "更多", "ellipsis", "更多：读码、延时、AI、重新选择")
+        let row=NSStackView(); row.orientation = .horizontal; row.alignment = .centerY; row.spacing=5
+        row.translatesAutoresizingMaskIntoConstraints=false; content.addSubview(row)
+        let cancel=button("cancel","取消","xmark","取消截图 · Esc")
+        cancel.title=""; cancel.imagePosition = .imageOnly; row.addArrangedSubview(cancel)
+        cancel.widthAnchor.constraint(equalToConstant:32).isActive=true
+        cancel.heightAnchor.constraint(equalToConstant:42).isActive=true
+        let definitions=[
+            ("edit","标注","square.and.pencil","标注 · E  箭头、文字、遮盖与裁剪"),
+            ("ocr","文字","text.viewfinder","提取文字 · O  识别后可修改、复制或翻译"),
+            ("translate","翻译","character.bubble","翻译 · T  自动识别选区文字并翻译"),
+            ("pin","贴图","pin","贴图 · P  置顶对照，滚轮缩放，右键关闭"),
+            ("long","长截图","rectangle.portrait.and.arrow.right","长截图 · L  逐段截取，保留三分之一重叠"),
+            ("save","保存","square.and.arrow.down","保存 · S  选择文件名和保存位置"),
+            ("more","更多","ellipsis","更多：读码、延时、AI、重新选择")
         ]
         for (id,name,icon,hint) in definitions {
-            let b = button(id,name,icon,hint); b.compactContent(title: name,icon: icon); actions.addArrangedSubview(b)
-            b.widthAnchor.constraint(equalToConstant: 47).isActive = true
-            b.heightAnchor.constraint(equalToConstant: 46).isActive = true
+            let b=button(id,name,icon,hint); b.compactContent(title:name,icon:icon); row.addArrangedSubview(b)
+            b.widthAnchor.constraint(equalToConstant:43).isActive=true
+            b.heightAnchor.constraint(equalToConstant:46).isActive=true
         }
-        let actionContent = NSView(); actions.translatesAutoresizingMaskIntoConstraints = false; actionContent.addSubview(actions)
-        NSLayoutConstraint.activate([actions.leadingAnchor.constraint(equalTo: actionContent.leadingAnchor,constant: 9),actions.trailingAnchor.constraint(equalTo: actionContent.trailingAnchor,constant: -9),actions.topAnchor.constraint(equalTo: actionContent.topAnchor,constant: 6),actions.bottomAnchor.constraint(equalTo: actionContent.bottomAnchor,constant: -6)])
-        let actionGlass = glassSurface(actionContent,radius: 29); row.addArrangedSubview(actionGlass)
-        actionGlass.heightAnchor.constraint(equalToConstant: 58).isActive = true
-        actionGlass.widthAnchor.constraint(equalToConstant: 347).isActive = true
-        let copy = button("copy", "复制", "doc.on.doc", "复制图片 · Return  完成后直接粘贴",primary: true)
-        copy.isBordered = false; copy.contentTintColor = .white
-        copy.attributedTitle = NSAttributedString(string: "复制",attributes: [.foregroundColor:NSColor.white,.font:NSFont.systemFont(ofSize: 13,weight: .semibold)])
-        let copyContent = NSView(); copy.translatesAutoresizingMaskIntoConstraints = false; copyContent.addSubview(copy)
-        NSLayoutConstraint.activate([copy.leadingAnchor.constraint(equalTo: copyContent.leadingAnchor,constant: 12),copy.trailingAnchor.constraint(equalTo: copyContent.trailingAnchor,constant: -12),copy.topAnchor.constraint(equalTo: copyContent.topAnchor,constant: 7),copy.bottomAnchor.constraint(equalTo: copyContent.bottomAnchor,constant: -7)])
-        let copyGlass = glassSurface(copyContent,radius: 22,tint: .controlAccentColor); row.addArrangedSubview(copyGlass)
-        copyGlass.widthAnchor.constraint(equalToConstant: 88).isActive = true
-        copyGlass.heightAnchor.constraint(equalToConstant: 44).isActive = true
-        let tipContent = NSView(); tipContent.addSubview(tip)
-        let tipGlass = glassSurface(tipContent,radius: 12); tipGlass.translatesAutoresizingMaskIntoConstraints = false; content.addSubview(tipGlass)
+        let separator=NSBox(); separator.boxType = .separator; row.addArrangedSubview(separator)
+        separator.widthAnchor.constraint(equalToConstant:1).isActive=true
+        separator.heightAnchor.constraint(equalToConstant:28).isActive=true
+        let copy=button("copy","复制","doc.on.doc","复制图片 · Return  完成后直接粘贴",primary:true)
+        row.addArrangedSubview(copy)
+        copy.widthAnchor.constraint(equalToConstant:82).isActive=true
+        copy.heightAnchor.constraint(equalToConstant:34).isActive=true
         NSLayoutConstraint.activate([
-            row.centerXAnchor.constraint(equalTo: content.centerXAnchor), row.topAnchor.constraint(equalTo: content.topAnchor,constant: 3),
-            tipGlass.centerXAnchor.constraint(equalTo: content.centerXAnchor),tipGlass.bottomAnchor.constraint(equalTo: content.bottomAnchor,constant: -3),tipGlass.heightAnchor.constraint(equalToConstant: 23),
-            tipGlass.widthAnchor.constraint(lessThanOrEqualTo: content.widthAnchor,constant: -12),
-            tip.leadingAnchor.constraint(equalTo: tipContent.leadingAnchor,constant: 12),tip.trailingAnchor.constraint(equalTo: tipContent.trailingAnchor,constant: -12),tip.centerYAnchor.constraint(equalTo: tipContent.centerYAnchor)
+            row.centerXAnchor.constraint(equalTo:content.centerXAnchor),row.topAnchor.constraint(equalTo:content.topAnchor,constant:10),
+            tip.leadingAnchor.constraint(equalTo:content.leadingAnchor,constant:14),tip.trailingAnchor.constraint(equalTo:content.trailingAnchor,constant:-14),
+            tip.bottomAnchor.constraint(equalTo:content.bottomAnchor,constant:-10),tip.heightAnchor.constraint(equalToConstant:18)
         ])
-        tip.stringValue = defaultTip
+        tip.textColor = .secondaryLabelColor; tip.stringValue=defaultTip
     }
 
     func buildLongHUD() {
@@ -269,13 +254,23 @@ final class NativeCaptureUI: NSObject, NSMenuDelegate {
         ])
     }
 
+    func setOrigin(_ origin: CGPoint) {
+        let frame=ShotCoordinates.appKit(CGRect(origin:origin,size:panel.frame.size))
+        if panel.frame != frame {panel.setFrame(frame,display:false)}
+    }
+    func show(at origin: CGPoint,session: Int,motion: Bool,count: Int?=nil) {
+        setOrigin(origin)
+        var values: [String:Any]=["visible":true,"session":session,"motion":motion]
+        if let count {values["count"]=count}; update(values)
+    }
+
     func update(_ data: [String: Any]) {
         if data["visible"] as? Bool == false { hide(); return }
         session = data["session"] as? Int ?? 0
         motion = data["motion"] as? Bool ?? true
         buttons.values.forEach { $0.motion = motion }
         setGlassMotion(panel.contentView,enabled: motion && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
-        if let rect = data["frame"] as? [String: Double], let x = rect["x"], let y = rect["y"] {
+        if let rect = data["frame"] as? [String:Any],let x = (rect["x"] as? NSNumber)?.doubleValue,let y = (rect["y"] as? NSNumber)?.doubleValue {
             let top = NSScreen.screens.first?.frame.maxY ?? 0
             let frame = NSRect(x: x, y: top - y - panel.frame.height, width: panel.frame.width, height: panel.frame.height)
             if panel.frame != frame { panel.setFrame(frame, display: false) }
@@ -290,14 +285,10 @@ final class NativeCaptureUI: NSObject, NSMenuDelegate {
             panel.orderFrontRegardless(); panel.makeKey()
             if panel.alphaValue == 0 {
                 NSAnimationContext.runAnimationGroup { context in context.duration = 0.12; panel.animator().alphaValue = 1 }
-                panel.contentView?.wantsLayer = true
-                let arrival = CASpringAnimation(keyPath:"transform.scale"); arrival.fromValue = 0.97; arrival.toValue = 1
-                arrival.stiffness = 420; arrival.damping = 30; arrival.duration = 0.28
-                panel.contentView?.layer?.add(arrival,forKey:"arrival")
             }
         }
     }
-    func hide() { buttons.values.forEach { $0.resetInteraction() }; panel.orderOut(nil); panel.alphaValue = 1 }
+    func hide() { activeMenu?.cancelTracking(); buttons.values.forEach { $0.resetInteraction() }; panel.orderOut(nil); panel.alphaValue = 1 }
 
     func showOptions(for sender: NSButton) {
         let id = sender.identifier?.rawValue ?? "more"
@@ -313,6 +304,7 @@ final class NativeCaptureUI: NSObject, NSMenuDelegate {
         for (name,action,icon) in definitions {
             let item = NSMenuItem(title:name,action:#selector(menuAction(_:)),keyEquivalent:""); item.identifier = .init(action); item.target = self; item.image = symbol(icon,name,size:15); menu.addItem(item)
         }
+        activeMenu=menu; defer {activeMenu=nil}
         menu.popUp(positioning:nil,at:NSPoint(x:0,y:-5),in:sender)
     }
 
@@ -327,105 +319,4 @@ final class NativeCaptureUI: NSObject, NSMenuDelegate {
     }
     func menuWillOpen(_ menu: NSMenu) { send?(["event": "menu", "session": session, "open": true]) }
     func menuDidClose(_ menu: NSMenu) { send?(["event": "menu", "session": session, "open": false]) }
-}
-
-final class ShotService: NSObject {
-    let axQueue = DispatchQueue(label: "local.shotkit.accessibility", qos: .userInteractive)
-    let recognitionQueue = DispatchQueue(label:"local.shotkit.recognition",qos:.userInitiated)
-    var panels = [String: NativeCaptureUI]()
-    var toast: NativeStatusUI?
-    var library: NativeLibraryController?
-    var translation: NativeTranslationController?
-    var environmentObserver: NSObjectProtocol?
-    func start() {
-        NSApp.setActivationPolicy(.accessory); installServiceMenu()
-        environmentObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,object: nil,queue: .main) { _ in
-            emit(["event":"environment","reduceMotion":NSWorkspace.shared.accessibilityDisplayShouldReduceMotion])
-        }
-        var ready: [String:Any] = ["event": "ready", "reduceMotion": NSWorkspace.shared.accessibilityDisplayShouldReduceMotion]
-        if let tiff = symbol("viewfinder","截图",size: 18)?.tiffRepresentation,
-           let rep = NSBitmapImageRep(data: tiff), let png = rep.representation(using: .png,properties: [:]) {
-            ready["menuIcon"] = "data:image/png;base64," + png.base64EncodedString()
-        }
-        emit(ready)
-        RecognitionWarmup.shared.start()
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            while let line = readLine() {
-                guard line.utf8.count < 262144, let bytes = line.data(using: .utf8),
-                      let command = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any] else { continue }
-                DispatchQueue.main.async { self?.receive(command) }
-            }
-            DispatchQueue.main.async { NSApp.terminate(nil) }
-        }
-        NSApp.run()
-    }
-    func receive(_ command: [String: Any]) {
-        guard let id = command["id"] as? Int, let op = command["op"] as? String else { return }
-        emit(["event": "ack", "id": id])
-        let data = command["data"] as? [String: Any] ?? [:]
-        func reply(_ result: Any) { emit(["event": "reply", "id": id, "data": result]) }
-        switch op {
-        case "ax":
-            let pid = data["pid"] as? Int ?? 0, x = data["x"] as? Double ?? 0, y = data["y"] as? Double ?? 0
-            axQueue.async {
-                let start = ProcessInfo.processInfo.systemUptime
-                let frames = (try? accessibilityChain(["ax", String(pid), String(x), String(y)])) ?? []
-                DispatchQueue.main.async { reply(["frames": frames, "milliseconds": (ProcessInfo.processInfo.systemUptime - start) * 1000]) }
-            }
-        case "panel":
-            let kind = data["kind"] as? String ?? "toolbar"
-            guard ["toolbar", "long"].contains(kind) else { reply([:]); return }
-            if data["visible"] as? Bool != false || panels[kind] != nil {
-                if panels[kind] == nil { let panel = NativeCaptureUI(kind: kind); panel.send = emit; panels[kind] = panel }
-                panels[kind]?.update(data)
-            }
-            reply(["ok": true])
-        case "appearance":
-            let style = data["style"] as? String
-            NSApp.appearance = style == "light" ? NSAppearance(named: .aqua) : style == "dark" ? NSAppearance(named: .darkAqua) : nil
-            reply(["ok":true])
-        case "toast":
-            if toast == nil { toast = NativeStatusUI() }
-            toast?.show(data); reply(["ok":true])
-        case "dismissToast": toast?.hide(); reply(["ok":true])
-        case "history":
-            if library == nil { library = NativeLibraryController(); library?.send = emit }
-            library?.window.level = data["floating"] as? Bool == true ? .floating : .normal
-            library?.show(data["items"] as? [[String:Any]] ?? []); library?.window.orderFrontRegardless(); reply(["ok":true])
-        case "hideHistory": library?.window.orderOut(nil); emit(["event":"historyVisibility","visible":false]); reply(["ok":true])
-        case "translate":
-            guard let path = data["path"] as? String, FileManager.default.fileExists(atPath:path) else { reply(["error":"截图不存在"]); return }
-            let started = ProcessInfo.processInfo.systemUptime
-            if translation == nil { translation = NativeTranslationController(); translation?.model.send = emit }
-            translation?.show(path:path,target:data["target"] as? String,startedAt:started); reply(["ok":true,"windowID":translation!.window.windowNumber])
-        case "recognize":
-            guard let path = data["path"] as? String, FileManager.default.fileExists(atPath:path) else { reply(["error":"截图不存在"]); return }
-            RecognitionWarmup.shared.yieldToUser()
-            let codesOnly = data["codesOnly"] as? Bool == true
-            let key = TranslationMemory.imageKey(path)
-            if !codesOnly, let key, let cached = TranslationMemory.shared.text.object(forKey:key) { reply(["text":cached as String,"codes":[]]); return }
-            recognitionQueue.async {
-                let response = Result { try codesOnly ? recognizeCodes(path) : recognize(path,includeCodes:false) }
-                DispatchQueue.main.async {
-                    switch response {
-                    case .success(let values):
-                        if !codesOnly, let key, let text = values["text"] as? String { TranslationMemory.shared.text.setObject(text as NSString,forKey:key,cost:text.utf8.count) }
-                        reply(values)
-                    case .failure(let error): reply(["error":error.localizedDescription])
-                    }
-                }
-            }
-        case "translationStatus":
-            var status = translation?.model.diagnostics ?? ["stage":"closed"]
-            status["windowVisible"] = translation?.window.isVisible ?? false
-            status["windowID"] = translation?.window.windowNumber ?? 0
-            reply(status)
-        case "translationCancel": translation?.model.cancel(); reply(["ok":true])
-        case "interactionStatus":
-            reply(panels.mapValues { ui in ui.buttons.mapValues { ["state":$0.interaction,"enabled":$0.isEnabled] as [String:Any] } })
-        case "ping": reply(["ok": true])
-        case "shutdown": reply(["ok": true]); NSApp.terminate(nil)
-        default: reply(["error": "未知服务命令"])
-        }
-    }
 }

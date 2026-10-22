@@ -20,7 +20,7 @@ final class RecognitionWarmup {
             do { try configureRecognition(r); try VNImageRequestHandler(cgImage:cg).perform([r]); ok = true } catch { ok = false }
             DispatchQueue.main.async {
                 self?.request = nil
-                emit(["event":"recognitionReady","ok":ok,"milliseconds":(ProcessInfo.processInfo.systemUptime-started)*1000])
+                if !standaloneRuntime { emit(["event":"recognitionReady","ok":ok,"milliseconds":(ProcessInfo.processInfo.systemUptime-started)*1000]) }
             }
         }
     }
@@ -60,6 +60,7 @@ final class TranslationModel: ObservableObject {
     var request: VNRecognizeTextRequest?
     var session: TranslationSession?
     var path: String?
+    var inputToken=UUID()
     var openedAt = 0.0, ocrMs = 0.0, translationMs = 0.0, visibleMs = 0.0
     var cacheHit = false
     private var requestedSource = "", requestedTarget = "", requestedPrecise = false
@@ -80,20 +81,26 @@ final class TranslationModel: ObservableObject {
     }
     func cancel() { cancelWork(); stage = .cancelled; detail = "已停止 · 可以修改原文后重新翻译"; report() }
     func load(path: String, target: String?) {
+        loadInput(path:path,image:nil,target:target)
+    }
+    func load(image: CGImage,target: String?) {
+        loadInput(path:nil,image:image,target:target)
+    }
+    private func loadInput(path: String?,image: CGImage?,target: String?) {
         RecognitionWarmup.shared.yieldToUser()
-        cancelWork(); self.path = path; openedAt = ProcessInfo.processInfo.systemUptime
+        cancelWork(); self.path = path; inputToken=UUID(); openedAt = ProcessInfo.processInfo.systemUptime
         visibleMs = 0; ocrMs = 0; translationMs = 0; cacheHit = false; copied = false
         source = ""; result = ""; stage = .recognizing; detail = "正在识别选区文字…"
         if let target { self.target = target }
         let revision = generation
-        let key = TranslationMemory.imageKey(path)
+        let key = path.flatMap { TranslationMemory.imageKey($0) }
         if let key, let cached = TranslationMemory.shared.text.object(forKey: key) {
             acceptText(cached as String, target: target, revision: revision); return
         }
         let r = VNRecognizeTextRequest(); request = r
         queue.addOperation { [weak self] in
             let started = ProcessInfo.processInfo.systemUptime
-            let response = Result { try recognize(path, includeCodes: false, request: r) }
+            let response = Result { try image.map {try recognize($0,includeCodes:false,request:r)} ?? recognize(path!,includeCodes:false,request:r) }
             DispatchQueue.main.async {
                 guard let self, self.generation == revision else { return }
                 self.request = nil; self.ocrMs = (ProcessInfo.processInfo.systemUptime - started) * 1000
@@ -101,7 +108,7 @@ final class TranslationModel: ObservableObject {
                 case .success(let values):
                     let text = values["text"] as? String ?? ""
                     if let key, !text.isEmpty { TranslationMemory.shared.text.setObject(text as NSString, forKey: key, cost: text.utf8.count) }
-                    self.send?(["event":"recognized", "path":path, "text":text])
+                    if let path=self.path { self.send?(["event":"recognized", "path":path, "text":text]) }
                     self.acceptText(text, target: target, revision: revision)
                 case .failure(let error): self.stage = .failed; self.detail = "识别失败：\(error.localizedDescription)"; self.report()
                 }
@@ -120,7 +127,7 @@ final class TranslationModel: ObservableObject {
         } else { begin() }
     }
     func setText(_ text: String) {
-        cancelWork(); path = nil; openedAt = ProcessInfo.processInfo.systemUptime; ocrMs = 0
+        cancelWork(); path = nil; inputToken=UUID(); openedAt = ProcessInfo.processInfo.systemUptime; ocrMs = 0
         acceptText(text, target: nil, revision: generation)
     }
     func sourceEdited() {
@@ -274,6 +281,7 @@ final class NativeTranslationController: NSObject, NSWindowDelegate {
         if let startedAt { model.openedAt = startedAt }
         showWindow()
     }
+    func show(image: CGImage,target: String?) { model.load(image:image,target:target); showWindow() }
     func show(text: String) { model.setText(text); showWindow() }
     func showWindow() {
         window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps:true)

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Install or restore only ShotKit's files; never collect screenshot data."""
+"""Install the independent ShotKit app, optionally disabling only the old screenshot module."""
 import argparse
 import datetime
 import hashlib
 import json
-import os
 from pathlib import Path
 import re
 import shutil
@@ -12,11 +11,10 @@ import subprocess
 import sys
 import uuid
 
-ROOT = Path(__file__).resolve().parent.parent
-MODULES = ("screenshot.lua", "screenshot_snap.lua", "screenshot_overlay.lua", "screenshot_native.lua")
-FILES = (*MODULES, "ShotKit.app")
-STATE = "shotkit-install.json"
-BLOCK = '\n-- BEGIN SHOTKIT\nrequire("screenshot").start()\n-- END SHOTKIT\n'
+ROOT = Path(__file__).resolve().parents[1]
+STATE_NAME = 'shotkit-native-install.json'
+MARKER = '-- ShotKit screenshots now run in the independent ShotKit.app (Hammerspoon is not required).'
+START = re.compile(r'^([ \t]*)require[ \t]*\([ \t]*["\']screenshot["\'][ \t]*\)[ \t]*\.[ \t]*start[ \t]*\([ \t]*\)[ \t]*;?[ \t]*(?:--[^\n]*)?$', re.M)
 
 
 def digest(path):
@@ -26,160 +24,180 @@ def digest(path):
     if path.is_file():
         return hashlib.sha256(path.read_bytes()).hexdigest()
     h = hashlib.sha256()
-    for child in sorted(path.rglob("*")):
-        if child.is_file():
-            h.update(child.relative_to(path).as_posix().encode())
-            h.update(child.read_bytes())
+    for p in sorted(path.rglob('*')):
+        if p.is_file():
+            h.update(p.relative_to(path).as_posix().encode())
+            h.update(p.read_bytes())
     return h.hexdigest()
 
 
-def verify_app(app):
-    if not (app / "Contents/MacOS/ShotKit").is_file():
-        raise RuntimeError("Missing native helper. Build with zsh build.sh or use the complete release archive.")
-    if sys.platform != "darwin":
-        raise RuntimeError("ShotKit runs on macOS.")
-    subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)], check=True)
-
-
-def copy_item(source, target):
-    if source.is_dir():
-        shutil.copytree(source, target)
-    else:
-        shutil.copy2(source, target)
-
-
-def replace_item(source, target):
-    staged = target.with_name("." + target.name + ".shotkit-" + uuid.uuid4().hex)
-    copy_item(source, staged)
-    if target.is_dir():
-        shutil.rmtree(target)
-    os.replace(staged, target)
-
-
-def write_atomic(path, text):
-    staged = path.with_name("." + path.name + ".shotkit-" + uuid.uuid4().hex)
-    staged.write_text(text, encoding="utf-8")
-    os.replace(staged, path)
-
-
-def preflight(config, names):
-    for name in names:
-        path = config / name
-        if path.is_symlink():
-            raise RuntimeError(f"Refusing to replace symlink: {path}. Use --no-init for a linked init.lua, or install manually.")
-
-
-def init_content(original):
-    if "-- BEGIN SHOTKIT" in original:
-        pattern = r"\n?-- BEGIN SHOTKIT\n.*?-- END SHOTKIT\n?"
-        return re.sub(pattern, BLOCK, original, count=1, flags=re.S)
-    if re.search(r'require\s*\(\s*[\"\']screenshot[\"\']\s*\)\s*\.\s*start\s*\(', original):
-        return original
-    return original.rstrip("\n") + BLOCK
-
-
-def install(config, app, dry_run=False, no_init=False):
-    config, app = Path(config).expanduser().resolve(), Path(app).expanduser().resolve()
-    verify_app(app)
-    for name in MODULES:
-        if not (ROOT / "lua" / name).is_file():
-            raise RuntimeError(f"Missing source: {name}")
-    names = list(FILES) + ([] if no_init else ["init.lua"])
-    preflight(config, names + [STATE, ".shotkit-backups"])
-    if dry_run:
-        return {"dry_run": True, "config": str(config), "files": names}
-    config.mkdir(parents=True, exist_ok=True)
-    backup = config / ".shotkit-backups" / (datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8])
-    backup.mkdir(parents=True, mode=0o700)
-    present = []
-    for name in names:
-        if (config / name).exists():
-            copy_item(config / name, backup / name)
-            present.append(name)
-    if (config / STATE).exists():
-        shutil.copy2(config / STATE, backup / STATE)
-    changed = []
+def write_atomic(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name('.' + path.name + '-' + uuid.uuid4().hex)
     try:
-        for name in FILES:
-            changed.append(name)
-            replace_item(app if name == "ShotKit.app" else ROOT / "lua" / name, config / name)
-        if not no_init:
-            init = config / "init.lua"
-            original = init.read_text(encoding="utf-8") if init.exists() else ""
-            changed.append("init.lua")
-            write_atomic(init, init_content(original))
-        data = config / "screenshot-data"
-        data.mkdir(mode=0o700, exist_ok=True)
-        state = {"version": "4.2", "backup": str(backup), "files": names, "original_files": present,
-                 "installed": {name: digest(config / name) for name in names}}
-        write_atomic(config / STATE, json.dumps(state, ensure_ascii=False, indent=2) + "\n")
-    except Exception:
-        for name in reversed(changed):
-            target = config / name
-            if name in present:
-                replace_item(backup / name, target)
-            elif target.is_dir():
-                shutil.rmtree(target)
-            elif target.exists():
-                target.unlink()
-        raise
-    return {"installed": True, "backup": str(backup), "config": str(config)}
+        temporary.write_bytes(data)
+        temporary.chmod(0o600)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
-def uninstall(config, dry_run=False):
-    config = Path(config).expanduser().resolve()
-    state = json.loads((config / STATE).read_text(encoding="utf-8"))
-    backup = Path(state["backup"]).resolve()
-    if backup.parent != (config / ".shotkit-backups").resolve() or not backup.is_dir():
-        raise RuntimeError("Invalid or missing backup; no files were changed.")
-    names = state["files"]
-    if set(names) - set((*FILES, "init.lua")):
-        raise RuntimeError("Invalid installation manifest.")
-    preflight(config, names + [STATE])
-    for name in FILES:
-        if digest(config / name) != state["installed"].get(name):
-            raise RuntimeError(f"{name} changed after installation. Preserve your edits before restoring; no files were changed.")
-    for name in state["original_files"]:
-        if name not in names or not (backup / name).exists():
-            raise RuntimeError("An original backup file is missing; no files were changed.")
+def migrated_init(original):
+    """Recognize only a complete standalone startup statement; never rewrite unrelated Lua."""
+    changed, count = START.subn(lambda m: m[1] + MARKER, original)
+    if not count and 'screenshot' in original and re.search(r'(?m)^\s*[^-\n].*screenshot.*start', original):
+        raise RuntimeError('Unrecognized screenshot startup statement. Disable only that module manually; init.lua was not changed.')
+    return changed, count
+
+
+def verify_app(app):
+    if sys.platform != 'darwin':
+        raise RuntimeError('ShotKit runs on macOS.')
+    if not (app / 'Contents/MacOS/ShotKit').is_file():
+        raise RuntimeError('Missing ShotKit.app. Run zsh build.sh or use a complete release archive.')
+    subprocess.run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(app)], check=True)
+
+
+def ensure_regular(path):
+    if path.is_symlink():
+        raise RuntimeError(f'Refusing to replace symlink: {path}')
+
+
+def ensure_not_running(target):
+    executable = str(target / 'Contents/MacOS/ShotKit')
+    result = subprocess.run(['/usr/bin/pgrep', '-f', '^' + re.escape(executable) + r'( |$)'],
+                            capture_output=True, timeout=5)
+    if result.returncode == 0:
+        raise RuntimeError('Quit the installed ShotKit app before replacing or restoring it; no files were changed.')
+
+
+def stop_legacy(cli=None):
+    cli = cli or Path('/Applications/Hammerspoon.app/Contents/Frameworks/hs/hs')
+    if not cli.is_file():
+        return False
+    # Hammerspoon IPC, scoped to this project's module. Never reload or stop other scripts.
+    try:
+        result = subprocess.run([str(cli), '-c', 'local s=package.loaded["screenshot"]; if s and s.status then local x=s.status(); if x.selecting or x.capturing or x.longScreenshot then return "shotkit-busy" end end; if s and s.stop then s.stop() end; return "shotkit-stopped"'],
+                                capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and 'shotkit-stopped' in result.stdout
+
+
+def install(app, target, config, migrate=False, dry_run=False):
+    app, target, config = Path(app).expanduser().absolute(), Path(target).expanduser().absolute(), Path(config).expanduser().absolute()
+    verify_app(app)
+    ensure_not_running(target)
+    for p in (target, target.parent / '.shotkit-native-backups', target.parent / STATE_NAME):
+        ensure_regular(p)
+    init = config / 'init.lua'
+    if migrate:
+        ensure_regular(init)
+    original = init.read_bytes() if migrate and init.exists() else None
+    modified, count = migrated_init(original.decode('utf-8')) if original is not None else ('', 0)
+    if migrate:
+        ensure_regular(init)
+    result = {'app': str(target), 'standalone': True, 'legacy_startup_statements': count,
+              'history_retained': True, 'other_hammerspoon_scripts_unchanged': True}
     if dry_run:
-        return {"dry_run": True, "restore": str(backup), "history_retained": True}
-    for name in names:
-        target = config / name
-        if name == "init.lua" and digest(target) != state["installed"].get(name):
-            if target.exists():
-                current = target.read_text(encoding="utf-8")
-                write_atomic(target, current.replace(BLOCK, "\n"))
-            continue
-        if name in state["original_files"]:
-            replace_item(backup / name, target)
-        elif target.is_dir():
+        return dict(result, dry_run=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    backup = target.parent / '.shotkit-native-backups' / (datetime.datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8])
+    backup.mkdir(parents=True, mode=0o700)
+    old_app = target.exists()
+    if old_app:
+        shutil.copytree(target, backup / 'ShotKit.app')
+    manifest_path = target.parent / STATE_NAME
+    if manifest_path.exists():
+        shutil.copy2(manifest_path, backup / STATE_NAME)
+    if original is not None:
+        write_atomic(backup / 'init.lua', original)
+    staged = target.with_name('.ShotKit-' + uuid.uuid4().hex + '.app')
+    try:
+        shutil.copytree(app, staged)
+        verify_app(staged)
+        if target.exists():
             shutil.rmtree(target)
-        elif target.exists():
-            target.unlink()
-    previous = backup / STATE
+        staged.replace(target)
+        if original is not None and count:
+            write_atomic(init, modified.encode('utf-8'))
+        stopped = stop_legacy() if migrate and count else False
+        # If IPC is unavailable, never claim the old global hotkeys have been released.
+        result['legacy_runtime_stopped'] = stopped
+        state = dict(result, version='5.0.4', backup=str(backup), had_app=old_app,
+                     init_path=str(init), init_changed=bool(original is not None and count),
+                     installed_app=digest(target), installed_init=digest(init) if original is not None and count else None)
+        write_atomic(manifest_path, (json.dumps(state, ensure_ascii=False, indent=2) + '\n').encode())
+        return dict(result, backup=str(backup), installed=True)
+    except Exception:
+        if target.exists():
+            shutil.rmtree(target)
+        if old_app:
+            shutil.copytree(backup / 'ShotKit.app', target)
+        if original is not None:
+            write_atomic(init, original)
+        raise
+    finally:
+        if staged.exists():
+            shutil.rmtree(staged)
+
+
+def restore(target, dry_run=False):
+    target = Path(target).expanduser().absolute()
+    state_file = target.parent / STATE_NAME
+    ensure_regular(target)
+    ensure_not_running(target)
+    state = json.loads(state_file.read_text())
+    backup = Path(state['backup'])
+    if backup.parent != target.parent / '.shotkit-native-backups' or not backup.is_dir():
+        raise RuntimeError('Invalid backup directory; no files changed.')
+    if digest(target) != state['installed_app']:
+        raise RuntimeError('The installed app changed. Preserve the newer version before restoring.')
+    init = Path(state['init_path'])
+    if state['init_changed']:
+        ensure_regular(init)
+        if digest(init) != state['installed_init']:
+            raise RuntimeError('init.lua changed after migration. Restore only the screenshot startup line from the backup manually; no files changed.')
+    if dry_run:
+        return {'dry_run': True, 'backup': str(backup), 'history_retained': True}
+    if target.exists():
+        shutil.rmtree(target)
+    if state['had_app']:
+        shutil.copytree(backup / 'ShotKit.app', target)
+    if state['init_changed']:
+        write_atomic(init, (backup / 'init.lua').read_bytes())
+    previous = backup / STATE_NAME
     if previous.exists():
-        replace_item(previous, config / STATE)
+        write_atomic(state_file, previous.read_bytes())
     else:
-        (config / STATE).unlink()
-    return {"restored": True, "history_retained": True, "backup_retained": str(backup)}
+        state_file.unlink()
+    return {'restored': True, 'history_retained': True, 'backup_retained': str(backup)}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=Path.home() / ".hammerspoon")
-    parser.add_argument("--app", type=Path, default=ROOT / "build/ShotKit.app")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--no-init", action="store_true", help="Do not modify init.lua; add require(\"screenshot\").start() yourself")
-    parser.add_argument("--uninstall", action="store_true", help="Restore the previous installation; keep screenshot history")
+    bundled = ROOT / 'ShotKit.app'
+    parser.add_argument('--app', type=Path, default=bundled if bundled.exists() else ROOT / 'build/ShotKit.app')
+    parser.add_argument('--target', type=Path, default=Path.home() / 'Applications/ShotKit.app')
+    parser.add_argument('--config', type=Path, default=Path.home() / '.hammerspoon')
+    parser.add_argument('--migrate-hammerspoon', action='store_true', help='Back up init.lua, disable only require("screenshot").start(), stop only that module through IPC')
+    parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--restore', action='store_true')
     args = parser.parse_args()
     try:
-        result = uninstall(args.config, args.dry_run) if args.uninstall else install(args.config, args.app, args.dry_run, args.no_init)
-    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
-        parser.exit(1, f"ShotKit: {error}\n")
+        result = restore(args.target, args.dry_run) if args.restore else install(args.app, args.target, args.config, args.migrate_hammerspoon, args.dry_run)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        parser.exit(1, f'ShotKit: {error}\n')
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    print("Quit any active capture/editor first, then choose Hammerspoon → Reload Config. No automatic reload was performed.")
+    if args.dry_run:
+        print('Dry run: no files or running modules were changed.')
+    elif args.restore:
+        print('Quit native ShotKit before restoring. If reverting to Hammerspoon, reload its configuration yourself when ready.')
+    elif result.get('legacy_startup_statements') and not result.get('legacy_runtime_stopped'):
+        print('The old module could not be stopped through IPC. Quit any active screenshot, then reload Hammerspoon yourself to release its hotkeys.')
+    else:
+        print('Open the installed ShotKit.app. Allow Screen Recording in its setup window. Accessibility is optional for content detection.')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

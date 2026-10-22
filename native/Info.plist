@@ -3,19 +3,21 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleDisplayName</key>
-	<string>截图增强</string>
+	<string>ShotKit 截图</string>
 	<key>CFBundleExecutable</key>
 	<string>ShotKit</string>
 	<key>CFBundleIdentifier</key>
 	<string>local.screenshotplus.ShotKit</string>
 	<key>CFBundleName</key>
 	<string>ShotKit</string>
+	<key>CFBundleIconFile</key>
+	<string>ShotKit</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>4.2</string>
+	<string>5.0.4</string>
 	<key>CFBundleVersion</key>
-	<string>4.2</string>
+	<string>5.0.4</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>15.0</string>
 	<key>LSUIElement</key>

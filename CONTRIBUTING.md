@@ -1,13 +1,16 @@
 # Contributing
 
-Issues and pull requests are welcome, in Chinese or English.
+Build on an Apple Silicon Mac with Apple command line tools and the macOS 27 SDK:
 
-For a bug report, include macOS version, CPU architecture, Hammerspoon version, steps, expected behavior and actual behavior. Use a synthetic screenshot when possible; remove private content from logs and images before posting. Permissions, language downloads and multiple displays can change behavior.
+```sh
+zsh build.sh
+sh scripts/test.sh
+```
 
-Keep screen capture and document content on the device. Preserve the original PNG resolution, keyboard accessibility, reduced-motion behavior, and existing Hammerspoon configuration. Prefer native controls; avoid adding work to the mouse-move loop or making the main thread wait for OCR or translation.
+The default executable is a standalone AppKit application. There is no Lua or Hammerspoon runtime. Keep selection coordinates in Quartz global points; convert to AppKit only at window boundaries. Never block the main thread with AX queries, PNG encoding or history scans. All async capture/recognition work must reject stale results on cancellation or replacement.
 
-Run `python3 -m unittest discover -s tests -v` and the Lua tests (`scripts/test.sh`). Build and manually verify native UI changes on a Mac. Native compilation currently requires the macOS 27 SDK; the runtime deployment target is macOS 15.
+Synthetic fixtures and reports belong outside the public source tree. Never commit screenshot history, local installation manifests, private configuration, signing identities or diagnostics containing personal content. Public preview images must use synthetic data.
 
-Do not commit screenshot history, personal configuration, local backups, credentials, generated binaries or diagnostic dumps. Preview images should contain synthetic content only.
+For changes to selection, verify border stability, offscreen and negative-origin displays, mixed Retina scales, drag/resize/keyboard behavior and cancellation releasing display buffers. For changes to controllers, closing one editor/result/pin must leave the resident app and other windows running.
 
-By contributing, you agree that your contributions may be distributed under the repository's MIT license.
+Migration must touch only the screenshot startup statement and must preserve unrelated automation and all historical images. Do not auto-enable login startup, grant permissions, alter TCC databases or weaken Gatekeeper. Ad-hoc signing is local development, not notarization.
